@@ -75,7 +75,7 @@ H = 50
 T = range(1, H + 1)
 
 # Set of projects (I)
-I = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+I = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
 
 # Number of jobs (J)
 J_common = sorted(operations_df["OP_NUM"].unique())
@@ -326,12 +326,19 @@ for i in range(1, len(I)):
 # 7. OBJECTIVE
 # =========================
 
-# Minimize tardiness first, then avoid unnecessary overtime
 if USE_OVERTIME:
-    model.setObjective(
-        gp.quicksum(L[i] for i in I)
-        + 0.0001 * gp.quicksum(OT[(k, t)] for k, t in OT),
-        GRB.MINIMIZE
+    model.setObjectiveN(
+        gp.quicksum(L[i] for i in I),
+        index=0,
+        priority=2,
+        name="Minimize tardiness"
+    )
+
+    model.setObjectiveN(
+        gp.quicksum(OT[k, t] for k, t in OT),
+        index=1,
+        priority=1,
+        name="Minimize overtime"
     )
 else:
     model.setObjective(gp.quicksum(L[i] for i in I), GRB.MINIMIZE)
@@ -345,7 +352,7 @@ model.update()
 
 # Set Gurobi parameters
 model.Params.TimeLimit = 3600
-model.Params.MIPGap = 0.05
+model.Params.MIPGap = 0.0
 model.Params.OutputFlag = 1
 model.Params.LogToConsole = 0
 
@@ -419,29 +426,45 @@ with open(output_file, "w", encoding="utf-8") as f:
         both("============================================================")
 
         assigned = {}
+
         for i in I:
             assigned[i] = {}
+
             for j in J[i]:
-                # Robust fallback: pick the bucket with the highest x-value.
-                # This avoids issues if the solver returns a fractional solution.
                 candidates = [
                     (t, x[(i, j, t)].X or 0.0)
                     for t in feasible_t[(i, j)]
+                    if (i, j, t) in x
                 ]
+
                 assigned_t, assigned_val = max(candidates, key=lambda item: item[1])
-                assigned[i][j] = assigned_t
+
+                assigned[i][j] = {
+                    "bucket": assigned_t,
+                    "mode": "In-house",
+                    "value": assigned_val
+                }
 
                 if assigned_val < 0.5:
                     both(
-                        f"Warning: Project {i}, Job {j} has no near-binary start (max x = {assigned_val:.4f}). "
-                        f"Using bucket {assigned_t}."
+                        f"Warning: Project {i}, Job {j} has no near-binary start "
+                        f"(max x = {assigned_val:.4f}). Using bucket {assigned_t}."
                     )
 
         for i in I:
             both(f"\nProject {i}")
-            for j, t in sorted(assigned[i].items(), key=lambda item: (item[1], item[0])):
-                both(f"  Bucket {t:>2} <- Job {j:>4} (proc_time = {d[j]:.2f})")
 
+            sorted_jobs = sorted(
+                assigned[i].items(),
+                key=lambda item: (
+                    item[1]["bucket"] if item[1]["bucket"] is not None else 10**9,
+                    item[0]
+                )
+            )
+
+            for j, info in sorted_jobs:
+                t = info["bucket"]
+                both(f"  Bucket {t:>2} <- Job {j:>4} [In-house] (proc_time = {d[j]:.2f})")
 
         both("\n============================================================")
         both("RESOURCE USAGE BY BUCKET")
@@ -449,6 +472,7 @@ with open(output_file, "w", encoding="utf-8") as f:
 
         for k in K:
             printed_any = False
+
             for t in T:
                 used = sum(
                     cons * x[(i, j, t)].X
@@ -456,12 +480,22 @@ with open(output_file, "w", encoding="utf-8") as f:
                     for j, cons in jobs_by_resource[k]
                     if (i, j, t) in x and x[(i, j, t)].X is not None
                 )
+
+                overtime_used = (
+                    clean_zero(OT[(k, t)].X)
+                    if USE_OVERTIME and (k, t) in OT
+                    else 0.0
+                )
+
                 if used > 1e-6:
                     both(
                         f"Resource {k:>4}, bucket {t:>2}: "
-                        f"used {used:>8.2f}, available {a[(k, t)]:>8.2f}"
+                        f"used {used:>8.2f}, "
+                        f"regular available {a[(k, t)]:>8.2f}, "
+                        f"overtime used {overtime_used:>8.2f}"
                     )
                     printed_any = True
+
             if printed_any:
                 both()
 
@@ -476,27 +510,95 @@ with open(output_file, "w", encoding="utf-8") as f:
                 for t in T:
                     if (k, t) in OT:
                         ot_used = clean_zero(OT[(k, t)].X)
+
                         if ot_used > 1e-6:
                             both(
                                 f"Resource {k:>4}, bucket {t:>2}: "
-                                f"overtime used {ot_used:>8.2f} / {OVERTIME_PER_BUCKET[k]:.2f}"
+                                f"overtime used {ot_used:>8.2f} / "
+                                f"{OVERTIME_PER_BUCKET[k]:.2f}"
                             )
                             printed_any_ot = True
 
             if not printed_any_ot:
                 both("No overtime was used.")
 
+            both("\n============================================================")
+            both("JOBS USING OVERTIME CAPACITY")
+            both("============================================================")
+
+            printed_any_job_ot = False
+
+            for k in sorted(K):
+                for t in T:
+
+                    if (k, t) not in OT:
+                        continue
+
+                    ot_used = clean_zero(OT[(k, t)].X)
+
+                    if ot_used <= 1e-6:
+                        continue
+
+                    regular_capacity = a[(k, t)]
+                    overtime_capacity = OVERTIME_PER_BUCKET[k]
+
+                    total_used = sum(
+                        cons * x[(i, j, t)].X
+                        for i in I
+                        for j, cons in jobs_by_resource[k]
+                        if (i, j, t) in x and x[(i, j, t)].X is not None
+                    )
+
+                    jobs_in_bucket = []
+
+                    for i in I:
+                        for j, cons in jobs_by_resource[k]:
+                            if (i, j, t) in x and x[(i, j, t)].X is not None:
+                                if x[(i, j, t)].X > 0.5:
+                                    jobs_in_bucket.append((i, j, cons))
+
+                    if jobs_in_bucket:
+                        both(
+                            f"\nResource {k}, bucket {t}: "
+                            f"used {total_used:.2f}, "
+                            f"regular capacity {regular_capacity:.2f}, "
+                            f"overtime used {ot_used:.2f} / {overtime_capacity:.2f}"
+                        )
+
+                        both("  In-house jobs scheduled in this overtime bucket:")
+
+                        for i, j, cons in sorted(jobs_in_bucket):
+                            both(
+                                f"    Project {i:>2}, Job {j:>4}: "
+                                f"resource consumption = {cons:.2f}"
+                            )
+
+                        printed_any_job_ot = True
+
+            if not printed_any_job_ot:
+                both("No in-house jobs used overtime capacity.")
+
         both("\n============================================================")
         both("JOB START SUMMARY TABLE")
         both("============================================================")
-        both("Project   Job   StartBucket   ProcTime   FinishMeasure")
-        both("-------   ---   -----------   --------   -------------")
+        both("Project   Job    StartBucket   Mode         ProcTime   FinishMeasure")
+        both("-------   ----   -----------   ----------   --------   -------------")
 
         for i in I:
-            for j, t in sorted(assigned[i].items(), key=lambda item: (item[1], item[0])):
+            sorted_jobs = sorted(
+                assigned[i].items(),
+                key=lambda item: (
+                    item[1]["bucket"] if item[1]["bucket"] is not None else 10**9,
+                    item[0]
+                )
+            )
+
+            for j, info in sorted_jobs:
+                t = info["bucket"]
+
                 both(
-                    f"{i:>7}   {j:>3}   {t:>11}   "
-                    f"{d[j]:>8.2f}   {t + d[j]:>13.2f}"
+                    f"{i:>7}   {j:>4}   {t:>11}   "
+                    f"{'In-house':>10}   {d[j]:>8.2f}   {t + d[j]:>13.2f}"
                 )
 
     else:
@@ -507,5 +609,3 @@ with open(output_file, "w", encoding="utf-8") as f:
 log(f"\nResults written to: {output_file}")
 log(f"Run log written to: {log_file}")
 log(f"Gurobi solver log written to: {solver_log_file}")
-
-
